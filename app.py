@@ -8,7 +8,7 @@ import streamlit as st
 import pandas as pd
 import pytesseract
 from PIL import Image
-import google.generativeai as genai
+from google import genai
 
 
 # ── 1. LLM CALL (Google Gemini - free tier) ──────────────────────────────────
@@ -16,8 +16,7 @@ def call_llm(text: str) -> str:
     """Send text to Google Gemini and return a JSON string."""
 
     # Reads the API key from Streamlit secrets
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     prompt = f"""
     Extract all structured data from the text below and return it as a JSON array
@@ -27,7 +26,10 @@ def call_llm(text: str) -> str:
     {text}
     """
 
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=prompt
+    )
     return response.text
 
 
