@@ -95,9 +95,13 @@ def main():
     st.header("2 · Extract structured data")
     run = st.button("🚀 Send to LLM", disabled=not raw_text.strip())
 
-    if run:
-        with st.spinner("Calling LLM…"):
+if run:
+    with st.spinner("Calling LLM…"):
+        try:
             llm_output = call_llm(raw_text)
+        except Exception as e:
+            st.error(f"Error: {e}")
+            st.stop()
 
         with st.expander("Raw LLM response", expanded=False):
             st.code(llm_output, language="json")
