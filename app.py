@@ -1,5 +1,5 @@
 """
-Streamlit app: Extract text from image/CSV/paste → LLM → DataFrame → CSV download
+Streamlit app: Extract text from image/CSV/PDF/paste → LLM → Output → Download
 """
 
 import json
@@ -9,15 +9,14 @@ import pandas as pd
 import pytesseract
 from PIL import Image
 from google import genai
+import pypdf
 
 
-# ── 1. LLM CALL (Google Gemini - free tier) ──────────────────────────────────
-def call_llm(text: str) -> str:
-    """Send text to Google Gemini and return a JSON string."""
+# ── 1. LLM CALLS ─────────────────────────────────────────────────────────────
 
-    # Reads the API key from Streamlit secrets
+def call_llm_csv(text: str) -> str:
+    """Ask Gemini to extract structured data as a JSON array for CSV export."""
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-
     prompt = f"""
     Extract all structured data from the text below and return it as a JSON array
     of flat objects (same keys in every object). Return ONLY valid JSON, no explanation.
@@ -25,15 +24,44 @@ def call_llm(text: str) -> str:
     Text:
     {text}
     """
+    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    return response.text
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
+
+def call_llm_slide(text: str) -> str:
+    """Ask Gemini to reformat content as clean slide-ready bullet points."""
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    prompt = f"""
+    Reformat the content below into clean, concise bullet points suitable for a
+    presentation slide. Group related points under short bold headings where helpful.
+    Return plain text only, no JSON, no markdown code blocks.
+
+    Text:
+    {text}
+    """
+    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    return response.text
+
+
+def call_llm_summary(text: str) -> str:
+    """Ask Gemini to produce a summary and action items as JSON."""
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    prompt = f"""
+    Read the text below and return a JSON object with exactly two keys:
+    - "summary": a list of 3-5 strings, each a key takeaway from the text
+    - "action_items": a list of objects with keys "task", "owner" (if mentioned, else "Unassigned"), and "due_date" (if mentioned, else "TBD")
+
+    Return ONLY valid JSON, no explanation.
+
+    Text:
+    {text}
+    """
+    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
     return response.text
 
 
 # ── 2. TEXT EXTRACTION HELPERS ───────────────────────────────────────────────
+
 def extract_text_from_image(uploaded_file) -> str:
     """Use pytesseract (OCR) to pull text out of an uploaded image."""
     image = Image.open(uploaded_file)
@@ -41,36 +69,48 @@ def extract_text_from_image(uploaded_file) -> str:
 
 
 def extract_text_from_csv(uploaded_file) -> str:
-    """Read a CSV and convert it to a plain-text representation for the LLM."""
+    """Read a CSV and convert it to plain text for the LLM."""
     df = pd.read_csv(uploaded_file)
     return df.to_string(index=False)
 
 
-# ── 3. RESPONSE PARSER ───────────────────────────────────────────────────────
-def parse_llm_response(response: str) -> pd.DataFrame:
-    """
-    Parse the LLM's JSON string into a pandas DataFrame.
-    Expects a JSON array of flat objects: [{...}, {...}, ...]
-    """
-    # Strip markdown fences if the model wraps the JSON in ```json ... ```
+def extract_text_from_pdf(uploaded_file) -> str:
+    """Extract text from each page of an uploaded PDF."""
+    reader = pypdf.PdfReader(uploaded_file)
+    pages = [page.extract_text() for page in reader.pages if page.extract_text()]
+    return "\n\n".join(pages)
+
+
+# ── 3. RESPONSE PARSERS ──────────────────────────────────────────────────────
+
+def parse_csv_response(response: str) -> pd.DataFrame:
+    """Parse a JSON array from the LLM into a DataFrame."""
     cleaned = response.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     data = json.loads(cleaned)
-
     if not isinstance(data, list):
-        raise ValueError("LLM response must be a JSON array of objects.")
-
+        raise ValueError("Expected a JSON array of objects.")
     return pd.DataFrame(data)
 
 
+def parse_summary_response(response: str) -> dict:
+    """Parse the summary + action items JSON from the LLM."""
+    cleaned = response.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    data = json.loads(cleaned)
+    if "summary" not in data or "action_items" not in data:
+        raise ValueError("Response missing 'summary' or 'action_items' keys.")
+    return data
+
+
 # ── 4. STREAMLIT UI ──────────────────────────────────────────────────────────
+
 def main():
-    st.set_page_config(page_title="Text → LLM → Table", layout="centered")
-    st.title("📋 Text → LLM → Structured Table")
-    st.caption("Upload an image, a CSV, or paste text — the LLM extracts structure for you.")
+    st.set_page_config(page_title="Navistone Content Extractor", layout="centered")
+    st.title("📋 Navistone Content Extractor")
+    st.caption("Upload an image, PDF, CSV, or paste text — then choose how to extract it.")
 
     # ── Input section ────────────────────────────────────────────────────────
     st.header("1 · Provide input")
-    input_mode = st.radio("Input type", ["Image (OCR)", "CSV", "Paste text"], horizontal=True)
+    input_mode = st.radio("Input type", ["Image (OCR)", "PDF", "CSV", "Paste text"], horizontal=True)
 
     raw_text = ""
 
@@ -78,8 +118,16 @@ def main():
         img_file = st.file_uploader("Upload PNG or JPG", type=["png", "jpg", "jpeg"])
         if img_file:
             st.image(img_file, caption="Uploaded image", use_container_width=True)
-            raw_text = extract_text_from_image(img_file)
+            with st.spinner("Reading text from image..."):
+                raw_text = extract_text_from_image(img_file)
             st.text_area("Extracted text (OCR)", raw_text, height=160, disabled=True)
+
+    elif input_mode == "PDF":
+        pdf_file = st.file_uploader("Upload PDF", type=["pdf"])
+        if pdf_file:
+            with st.spinner("Reading text from PDF..."):
+                raw_text = extract_text_from_pdf(pdf_file)
+            st.text_area("Extracted text (PDF)", raw_text, height=160, disabled=True)
 
     elif input_mode == "CSV":
         csv_file = st.file_uploader("Upload CSV", type=["csv"])
@@ -89,42 +137,78 @@ def main():
 
     else:  # Paste text
         raw_text = st.text_area("Paste your text here", height=200,
-                                placeholder="Names, dates, addresses, table data…")
+                                placeholder="Paste an email, meeting notes, campaign details…")
 
-    # ── LLM call ─────────────────────────────────────────────────────────────
-    st.header("2 · Extract structured data")
-    run = st.button("🚀 Send to LLM", disabled=not raw_text.strip())
+    # ── Extraction mode ──────────────────────────────────────────────────────
+    st.header("2 · Choose extraction type")
+    extraction_mode = st.radio(
+        "What do you want?",
+        ["Extract to CSV", "Slide Ready", "Summary & Action Items"],
+        horizontal=True,
+        help=(
+            "Extract to CSV: pulls structured data into a downloadable spreadsheet. "
+            "Slide Ready: formats content as bullet points for a presentation. "
+            "Summary & Action Items: key takeaways plus a list of tasks and owners."
+        )
+    )
+
+    # ── Run ──────────────────────────────────────────────────────────────────
+    st.header("3 · Extract")
+    run = st.button("🚀 Run", disabled=not raw_text.strip())
 
     if run:
-        with st.spinner("Calling LLM…"):
+        with st.spinner("Sending to Gemini..."):
             try:
-                llm_output = call_llm(raw_text)
+                if extraction_mode == "Extract to CSV":
+                    llm_output = call_llm_csv(raw_text)
+                elif extraction_mode == "Slide Ready":
+                    llm_output = call_llm_slide(raw_text)
+                else:
+                    llm_output = call_llm_summary(raw_text)
             except Exception as e:
                 st.error(f"Error: {e}")
                 st.stop()
 
-        with st.expander("Raw LLM response", expanded=False):
-            st.code(llm_output, language="json")
+        # ── Display results ──────────────────────────────────────────────────
+        st.header("4 · Results")
 
-        # ── Parse & display ──────────────────────────────────────────────────
-        st.header("3 · Result table")
-        try:
-            df = parse_llm_response(llm_output)
-            st.dataframe(df, use_container_width=True)
+        if extraction_mode == "Extract to CSV":
+            try:
+                df = parse_csv_response(llm_output)
+                st.dataframe(df, use_container_width=True)
+                csv_bytes = df.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download as CSV", data=csv_bytes,
+                                   file_name="extracted_data.csv", mime="text/csv")
+            except (json.JSONDecodeError, ValueError) as e:
+                st.error(f"Could not parse response: {e}")
+                st.code(llm_output)
 
-            # ── CSV download ─────────────────────────────────────────────────
-            st.header("4 · Download")
-            csv_bytes = df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label="⬇️ Download as CSV",
-                data=csv_bytes,
-                file_name="extracted_data.csv",
-                mime="text/csv",
-            )
+        elif extraction_mode == "Slide Ready":
+            st.markdown(llm_output)
+            st.download_button("⬇️ Download as .txt", data=llm_output.encode("utf-8"),
+                               file_name="slide_content.txt", mime="text/plain")
 
-        except (json.JSONDecodeError, ValueError) as e:
-            st.error(f"Could not parse LLM response: {e}")
-            st.info("Make sure your LLM call returns a JSON array of flat objects.")
+        else:  # Summary & Action Items
+            try:
+                data = parse_summary_response(llm_output)
+
+                st.subheader("📌 Key Takeaways")
+                for point in data["summary"]:
+                    st.markdown(f"- {point}")
+
+                st.subheader("✅ Action Items")
+                if data["action_items"]:
+                    action_df = pd.DataFrame(data["action_items"])
+                    st.dataframe(action_df, use_container_width=True)
+                    csv_bytes = action_df.to_csv(index=False).encode("utf-8")
+                    st.download_button("⬇️ Download Action Items as CSV", data=csv_bytes,
+                                       file_name="action_items.csv", mime="text/csv")
+                else:
+                    st.info("No action items found.")
+
+            except (json.JSONDecodeError, ValueError) as e:
+                st.error(f"Could not parse response: {e}")
+                st.code(llm_output)
 
 
 if __name__ == "__main__":
