@@ -2,6 +2,7 @@
 Streamlit app: Extract text from image/CSV/PDF/paste → LLM → Output → Download
 """
 
+import io
 import json
 import os
 import streamlit as st
@@ -15,7 +16,7 @@ import pypdf
 # ── 1. LLM CALLS ─────────────────────────────────────────────────────────────
 
 def call_llm_csv(text: str) -> str:
-    """Ask Gemini to extract structured data as a JSON array for CSV export."""
+    """Ask Gemini to extract structured data as a JSON array for export."""
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
     prompt = f"""
     Extract all structured data from the text below and return it as a JSON array
@@ -101,7 +102,33 @@ def parse_summary_response(response: str) -> dict:
     return data
 
 
-# ── 4. STREAMLIT UI ──────────────────────────────────────────────────────────
+# ── 4. DOWNLOAD HELPERS ──────────────────────────────────────────────────────
+
+def download_buttons(df: pd.DataFrame, csv_filename: str, excel_filename: str):
+    """Show both a CSV and an Excel download button for a given DataFrame."""
+    col1, col2 = st.columns(2)
+
+    with col1:
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="⬇️ Download as CSV",
+            data=csv_bytes,
+            file_name=csv_filename,
+            mime="text/csv"
+        )
+
+    with col2:
+        excel_buffer = io.BytesIO()
+        df.to_excel(excel_buffer, index=False, engine="openpyxl")
+        st.download_button(
+            label="⬇️ Download as Excel",
+            data=excel_buffer.getvalue(),
+            file_name=excel_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+
+# ── 5. STREAMLIT UI ──────────────────────────────────────────────────────────
 
 def main():
     st.set_page_config(page_title="Navistone Content Extractor", layout="centered")
@@ -176,9 +203,7 @@ def main():
             try:
                 df = parse_csv_response(llm_output)
                 st.dataframe(df, use_container_width=True)
-                csv_bytes = df.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Download as CSV", data=csv_bytes,
-                                   file_name="extracted_data.csv", mime="text/csv")
+                download_buttons(df, "extracted_data.csv", "extracted_data.xlsx")
             except (json.JSONDecodeError, ValueError) as e:
                 st.error(f"Could not parse response: {e}")
                 st.code(llm_output)
@@ -200,9 +225,7 @@ def main():
                 if data["action_items"]:
                     action_df = pd.DataFrame(data["action_items"])
                     st.dataframe(action_df, use_container_width=True)
-                    csv_bytes = action_df.to_csv(index=False).encode("utf-8")
-                    st.download_button("⬇️ Download Action Items as CSV", data=csv_bytes,
-                                       file_name="action_items.csv", mime="text/csv")
+                    download_buttons(action_df, "action_items.csv", "action_items.xlsx")
                 else:
                     st.info("No action items found.")
 
