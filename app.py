@@ -13,7 +13,8 @@ from PIL import Image
 from google import genai
 import pypdf
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 
 # ── 1. LLM CALLS ─────────────────────────────────────────────────────────────
@@ -41,19 +42,41 @@ def call_llm_csv(text: str, column_names: list) -> str:
     return response.text
 
 
-def call_llm_slide(text: str, slide_specs: list) -> str:
+def call_llm_word(text: str) -> str:
     """
-    Ask Gemini to generate slides based on user-defined specs.
-    slide_specs is a list of dicts: [{title, format}, ...]
-    Returns a JSON array of slide objects.
+    Ask Gemini to extract content into a structured JSON document
+    with sections, prose, and tables for a polished Word output.
     """
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    prompt = f"""
+    Read the text below and convert it into a structured document.
+    Return a JSON object with the following keys:
+    - "title": a short document title (string)
+    - "sections": a list of section objects. Each section object must have:
+        - "heading": section heading (string)
+        - "content": a list of content blocks, where each block is one of:
+            - {{"type": "paragraph", "text": "..."}}
+            - {{"type": "bullets", "items": ["...", "..."]}}
+            - {{"type": "table", "headers": ["col1", "col2"], "rows": [["val", "val"], ...]}}
 
+    Organize the content logically. Use tables where data is structured.
+    Use bullet points for lists. Use paragraphs for narrative content.
+    Return ONLY valid JSON, no explanation.
+
+    Text:
+    {text}
+    """
+    response = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    return response.text
+
+
+def call_llm_slide(text: str, slide_specs: list) -> str:
+    """Ask Gemini to generate slides based on user-defined specs."""
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
     spec_lines = "\n".join(
         f"Slide {i+1}: Title = \"{s['title']}\", Format = {s['format']}"
         for i, s in enumerate(slide_specs)
     )
-
     format_instructions = """
 Format rules:
 - "Title Slide": return keys "title" and "subtitle" (a short one-line summary)
@@ -63,7 +86,6 @@ Format rules:
 - "Timeline": return keys "title" and "events" (list of objects with "date" and "description")
 - "Action Items": return keys "title" and "actions" (list of objects with "task", "owner", "due_date")
 """
-
     prompt = f"""
     Using the source text below, generate a JSON array of presentation slides.
     Each slide must follow the exact format specified.
@@ -122,102 +144,122 @@ def extract_text_from_txt(uploaded_file) -> str:
     return uploaded_file.read().decode("utf-8")
 
 def extract_text_from_file(uploaded_file, input_mode: str) -> str:
-    if input_mode == "Image (OCR)":      return extract_text_from_image(uploaded_file)
-    elif input_mode == "PDF":            return extract_text_from_pdf(uploaded_file)
-    elif input_mode == "CSV":            return extract_text_from_csv(uploaded_file)
-    elif input_mode == "Excel (.xlsx)":  return extract_text_from_xlsx(uploaded_file)
+    if input_mode == "Image (OCR)":        return extract_text_from_image(uploaded_file)
+    elif input_mode == "PDF":              return extract_text_from_pdf(uploaded_file)
+    elif input_mode == "CSV":              return extract_text_from_csv(uploaded_file)
+    elif input_mode == "Excel (.xlsx)":    return extract_text_from_xlsx(uploaded_file)
     elif input_mode == "Text File (.txt)": return extract_text_from_txt(uploaded_file)
     return ""
 
 
 # ── 3. RESPONSE PARSERS ──────────────────────────────────────────────────────
 
-def parse_csv_response(response: str) -> pd.DataFrame:
+def parse_json(response: str):
+    """Strip markdown fences and parse JSON from LLM response."""
     cleaned = response.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    data = json.loads(cleaned)
+    return json.loads(cleaned)
+
+def parse_csv_response(response: str) -> pd.DataFrame:
+    data = parse_json(response)
     if not isinstance(data, list):
         raise ValueError("Expected a JSON array of objects.")
     return pd.DataFrame(data)
 
 def parse_summary_response(response: str) -> dict:
-    cleaned = response.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    data = json.loads(cleaned)
+    data = parse_json(response)
     if "summary" not in data or "action_items" not in data:
         raise ValueError("Response missing 'summary' or 'action_items' keys.")
     return data
 
 def parse_slide_response(response: str) -> list:
-    cleaned = response.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    data = json.loads(cleaned)
+    data = parse_json(response)
     if not isinstance(data, list):
         raise ValueError("Expected a JSON array of slide objects.")
     return data
 
-
-# ── 4. SLIDE RENDERERS ───────────────────────────────────────────────────────
-
-def render_slides_in_app(slides: list):
-    """Display each slide in the Streamlit UI based on its format."""
-    for i, slide in enumerate(slides):
-        fmt = slide.get("format", "Bullet Points")
-        st.markdown(f"---")
-        st.markdown(f"### Slide {i+1}")
-
-        if fmt == "Title Slide":
-            st.markdown(f"# {slide.get('title', '')}")
-            st.markdown(f"*{slide.get('subtitle', '')}*")
-
-        elif fmt == "Bullet Points":
-            st.markdown(f"**{slide.get('title', '')}**")
-            for b in slide.get("bullets", []):
-                st.markdown(f"- {b}")
-
-        elif fmt == "Table":
-            st.markdown(f"**{slide.get('title', '')}**")
-            headers = slide.get("headers", [])
-            rows = slide.get("rows", [])
-            if headers and rows:
-                st.dataframe(pd.DataFrame(rows, columns=headers), use_container_width=True)
-
-        elif fmt == "Two Column":
-            st.markdown(f"**{slide.get('title', '')}**")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown(f"**{slide.get('left_heading', 'Left')}**")
-                for p in slide.get("left_points", []):
-                    st.markdown(f"- {p}")
-            with col2:
-                st.markdown(f"**{slide.get('right_heading', 'Right')}**")
-                for p in slide.get("right_points", []):
-                    st.markdown(f"- {p}")
-
-        elif fmt == "Timeline":
-            st.markdown(f"**{slide.get('title', '')}**")
-            for e in slide.get("events", []):
-                st.markdown(f"- **{e.get('date', '')}** — {e.get('description', '')}")
-
-        elif fmt == "Action Items":
-            st.markdown(f"**{slide.get('title', '')}**")
-            actions = slide.get("actions", [])
-            if actions:
-                st.dataframe(pd.DataFrame(actions), use_container_width=True)
+def parse_word_response(response: str) -> dict:
+    data = parse_json(response)
+    if "title" not in data or "sections" not in data:
+        raise ValueError("Response missing 'title' or 'sections' keys.")
+    return data
 
 
-def build_word_doc(slides: list) -> bytes:
-    """Convert slide data into a Word document and return as bytes."""
+# ── 4. WORD DOCUMENT BUILDERS ─────────────────────────────────────────────────
+
+def add_table_to_doc(doc, headers: list, rows: list):
+    """Helper to add a formatted table to a Word doc."""
+    table = doc.add_table(rows=1 + len(rows), cols=len(headers))
+    table.style = "Table Grid"
+    # Header row
+    for j, h in enumerate(headers):
+        cell = table.rows[0].cells[j]
+        cell.text = h
+        run = cell.paragraphs[0].runs[0]
+        run.bold = True
+        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        cell.paragraphs[0].paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        # Dark blue background
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+        tc_pr = cell._tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:fill"), "1F3864")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:val"), "clear")
+        tc_pr.append(shd)
+    # Data rows
+    for r_idx, row in enumerate(rows):
+        for c_idx, val in enumerate(row):
+            table.rows[r_idx + 1].cells[c_idx].text = str(val) if val is not None else ""
+
+
+def build_word_doc_from_sections(doc_data: dict) -> bytes:
+    """Build a polished Word doc from structured section data."""
+    doc = Document()
+
+    # Title
+    title_para = doc.add_heading(doc_data.get("title", "Document"), level=0)
+    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph()
+
+    for section in doc_data.get("sections", []):
+        doc.add_heading(section.get("heading", ""), level=1)
+        for block in section.get("content", []):
+            btype = block.get("type", "paragraph")
+            if btype == "paragraph":
+                doc.add_paragraph(block.get("text", ""))
+            elif btype == "bullets":
+                for item in block.get("items", []):
+                    doc.add_paragraph(item, style="List Bullet")
+            elif btype == "table":
+                headers = block.get("headers", [])
+                rows = block.get("rows", [])
+                if headers and rows:
+                    add_table_to_doc(doc, headers, rows)
+                    doc.add_paragraph()
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def build_word_doc_from_slides(slides: list) -> bytes:
+    """Convert slide data into a formatted Word document."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
     doc = Document()
 
     for i, slide in enumerate(slides):
         fmt = slide.get("format", "Bullet Points")
-
         if i > 0:
             doc.add_page_break()
 
         if fmt == "Title Slide":
-            title_para = doc.add_heading(slide.get("title", ""), level=0)
-            title_para.alignment = 1  # center
+            p = doc.add_heading(slide.get("title", ""), level=0)
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             sub = doc.add_paragraph(slide.get("subtitle", ""))
-            sub.alignment = 1
+            sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
         elif fmt == "Bullet Points":
             doc.add_heading(slide.get("title", ""), level=1)
@@ -229,14 +271,7 @@ def build_word_doc(slides: list) -> bytes:
             headers = slide.get("headers", [])
             rows = slide.get("rows", [])
             if headers and rows:
-                table = doc.add_table(rows=1 + len(rows), cols=len(headers))
-                table.style = "Table Grid"
-                for j, h in enumerate(headers):
-                    table.rows[0].cells[j].text = h
-                    table.rows[0].cells[j].paragraphs[0].runs[0].bold = True
-                for r_idx, row in enumerate(rows):
-                    for c_idx, cell in enumerate(row):
-                        table.rows[r_idx + 1].cells[c_idx].text = str(cell)
+                add_table_to_doc(doc, headers, rows)
 
         elif fmt == "Two Column":
             doc.add_heading(slide.get("title", ""), level=1)
@@ -244,52 +279,83 @@ def build_word_doc(slides: list) -> bytes:
             table.style = "Table Grid"
             table.rows[0].cells[0].text = slide.get("left_heading", "")
             table.rows[0].cells[1].text = slide.get("right_heading", "")
-            table.rows[0].cells[0].paragraphs[0].runs[0].bold = True
-            table.rows[0].cells[1].paragraphs[0].runs[0].bold = True
-            left_pts = slide.get("left_points", [])
+            for cell in table.rows[0].cells:
+                cell.paragraphs[0].runs[0].bold = True
+            left_pts  = slide.get("left_points", [])
             right_pts = slide.get("right_points", [])
             for k in range(max(len(left_pts), len(right_pts))):
                 row = table.add_row()
-                row.cells[0].text = left_pts[k] if k < len(left_pts) else ""
+                row.cells[0].text = left_pts[k]  if k < len(left_pts)  else ""
                 row.cells[1].text = right_pts[k] if k < len(right_pts) else ""
 
         elif fmt == "Timeline":
             doc.add_heading(slide.get("title", ""), level=1)
             for e in slide.get("events", []):
                 p = doc.add_paragraph(style="List Bullet")
-                run_date = p.add_run(f"{e.get('date', '')} — ")
-                run_date.bold = True
+                p.add_run(f"{e.get('date', '')} — ").bold = True
                 p.add_run(e.get("description", ""))
 
         elif fmt == "Action Items":
             doc.add_heading(slide.get("title", ""), level=1)
             actions = slide.get("actions", [])
             if actions:
-                table = doc.add_table(rows=1 + len(actions), cols=3)
-                table.style = "Table Grid"
-                for j, h in enumerate(["Task", "Owner", "Due Date"]):
-                    table.rows[0].cells[j].text = h
-                    table.rows[0].cells[j].paragraphs[0].runs[0].bold = True
-                for r_idx, a in enumerate(actions):
-                    table.rows[r_idx + 1].cells[0].text = a.get("task", "")
-                    table.rows[r_idx + 1].cells[1].text = a.get("owner", "")
-                    table.rows[r_idx + 1].cells[2].text = a.get("due_date", "")
+                add_table_to_doc(doc, ["Task", "Owner", "Due Date"],
+                                 [[a.get("task",""), a.get("owner",""), a.get("due_date","")] for a in actions])
 
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
 
-# ── 5. STREAMLIT UI ──────────────────────────────────────────────────────────
+# ── 5. SLIDE RENDERER ────────────────────────────────────────────────────────
 
 SLIDE_FORMATS = ["Title Slide", "Bullet Points", "Table", "Two Column", "Timeline", "Action Items"]
+
+def render_slides_in_app(slides: list):
+    for i, slide in enumerate(slides):
+        fmt = slide.get("format", "Bullet Points")
+        st.markdown("---")
+        st.markdown(f"### Slide {i+1}")
+        if fmt == "Title Slide":
+            st.markdown(f"# {slide.get('title', '')}")
+            st.markdown(f"*{slide.get('subtitle', '')}*")
+        elif fmt == "Bullet Points":
+            st.markdown(f"**{slide.get('title', '')}**")
+            for b in slide.get("bullets", []):
+                st.markdown(f"- {b}")
+        elif fmt == "Table":
+            st.markdown(f"**{slide.get('title', '')}**")
+            headers, rows = slide.get("headers", []), slide.get("rows", [])
+            if headers and rows:
+                st.dataframe(pd.DataFrame(rows, columns=headers), use_container_width=True)
+        elif fmt == "Two Column":
+            st.markdown(f"**{slide.get('title', '')}**")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"**{slide.get('left_heading','Left')}**")
+                for p in slide.get("left_points", []): st.markdown(f"- {p}")
+            with col2:
+                st.markdown(f"**{slide.get('right_heading','Right')}**")
+                for p in slide.get("right_points", []): st.markdown(f"- {p}")
+        elif fmt == "Timeline":
+            st.markdown(f"**{slide.get('title', '')}**")
+            for e in slide.get("events", []):
+                st.markdown(f"- **{e.get('date','')}** — {e.get('description','')}")
+        elif fmt == "Action Items":
+            st.markdown(f"**{slide.get('title', '')}**")
+            actions = slide.get("actions", [])
+            if actions:
+                st.dataframe(pd.DataFrame(actions), use_container_width=True)
+
+
+# ── 6. STREAMLIT UI ──────────────────────────────────────────────────────────
 
 def main():
     st.set_page_config(page_title="Navistone Content Extractor", layout="centered")
     st.title("📋 Navistone Content Extractor")
     st.caption("Upload up to 10 files or paste text — then choose how to extract it.")
 
-    # ── Input section ────────────────────────────────────────────────────────
+    # ── Input ────────────────────────────────────────────────────────────────
     st.header("1 · Provide input")
     input_mode = st.radio(
         "Input type",
@@ -337,13 +403,13 @@ def main():
     st.header("2 · Choose extraction type")
     extraction_mode = st.radio(
         "What do you want?",
-        ["Extract to CSV", "Extract to Excel", "Slide Ready", "Summary & Action Items"],
+        ["Extract to CSV", "Extract to Excel", "Extract to Word", "Slide Ready", "Summary & Action Items"],
         horizontal=True,
     )
 
     # ── Sub-options ──────────────────────────────────────────────────────────
     column_names = []
-    slide_specs = []
+    slide_specs  = []
 
     if extraction_mode in ("Extract to CSV", "Extract to Excel"):
         st.markdown("**Column options**")
@@ -366,12 +432,11 @@ def main():
         st.markdown("**Define your slides**")
         num_slides = st.number_input("How many slides?", min_value=1, max_value=20, value=3, step=1)
         st.caption("Set a title and format for each slide below.")
-
         for i in range(int(num_slides)):
             col1, col2 = st.columns([2, 2])
             with col1:
                 title = st.text_input(f"Slide {i+1} title",
-                                      placeholder=f"e.g. {'Title' if i == 0 else 'Key Points' if i == 1 else 'Next Steps'}",
+                                      placeholder="e.g. Overview",
                                       key=f"slide_title_{i}")
             with col2:
                 fmt = st.selectbox(f"Slide {i+1} format", SLIDE_FORMATS,
@@ -388,6 +453,8 @@ def main():
             try:
                 if extraction_mode in ("Extract to CSV", "Extract to Excel"):
                     llm_output = call_llm_csv(raw_text, column_names)
+                elif extraction_mode == "Extract to Word":
+                    llm_output = call_llm_word(raw_text)
                 elif extraction_mode == "Slide Ready":
                     llm_output = call_llm_slide(raw_text, slide_specs)
                 else:
@@ -396,7 +463,7 @@ def main():
                 st.error(f"Error: {e}")
                 st.stop()
 
-        # ── Display results ──────────────────────────────────────────────────
+        # ── Results ──────────────────────────────────────────────────────────
         st.header("4 · Results")
 
         if extraction_mode == "Extract to CSV":
@@ -414,12 +481,42 @@ def main():
             try:
                 df = parse_csv_response(llm_output)
                 st.dataframe(df, use_container_width=True)
-                excel_buffer = io.BytesIO()
-                df.to_excel(excel_buffer, index=False, engine="openpyxl")
+                buf = io.BytesIO()
+                df.to_excel(buf, index=False, engine="openpyxl")
                 st.download_button("⬇️ Download as Excel",
-                                   data=excel_buffer.getvalue(),
+                                   data=buf.getvalue(),
                                    file_name="extracted_data.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            except (json.JSONDecodeError, ValueError) as e:
+                st.error(f"Could not parse response: {e}")
+                st.code(llm_output)
+
+        elif extraction_mode == "Extract to Word":
+            try:
+                doc_data = parse_word_response(llm_output)
+
+                # Preview in app
+                st.markdown(f"## {doc_data.get('title', '')}")
+                for section in doc_data.get("sections", []):
+                    st.markdown(f"### {section.get('heading', '')}")
+                    for block in section.get("content", []):
+                        if block.get("type") == "paragraph":
+                            st.markdown(block.get("text", ""))
+                        elif block.get("type") == "bullets":
+                            for item in block.get("items", []):
+                                st.markdown(f"- {item}")
+                        elif block.get("type") == "table":
+                            headers = block.get("headers", [])
+                            rows    = block.get("rows", [])
+                            if headers and rows:
+                                st.dataframe(pd.DataFrame(rows, columns=headers), use_container_width=True)
+
+                # Download
+                word_bytes = build_word_doc_from_sections(doc_data)
+                st.download_button("⬇️ Download as Word (.docx)",
+                                   data=word_bytes,
+                                   file_name="document.docx",
+                                   mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
             except (json.JSONDecodeError, ValueError) as e:
                 st.error(f"Could not parse response: {e}")
                 st.code(llm_output)
@@ -427,23 +524,17 @@ def main():
         elif extraction_mode == "Slide Ready":
             try:
                 slides = parse_slide_response(llm_output)
-                # Tag each slide with its format from the user's specs
                 for i, slide in enumerate(slides):
                     slide["format"] = slide_specs[i]["format"] if i < len(slide_specs) else "Bullet Points"
-
                 render_slides_in_app(slides)
-
-                # Download buttons
                 st.markdown("---")
                 col1, col2 = st.columns(2)
                 with col1:
-                    word_bytes = build_word_doc(slides)
                     st.download_button("⬇️ Download as Word (.docx)",
-                                       data=word_bytes,
+                                       data=build_word_doc_from_slides(slides),
                                        file_name="slides.docx",
                                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
                 with col2:
-                    # Plain text fallback
                     plain = "\n\n".join(
                         f"SLIDE {i+1}: {s.get('title','')}\n" + json.dumps(s, indent=2)
                         for i, s in enumerate(slides)
@@ -461,13 +552,12 @@ def main():
                 st.subheader("📌 Key Takeaways")
                 for point in data["summary"]:
                     st.markdown(f"- {point}")
-
                 st.subheader("✅ Action Items")
                 if data["action_items"]:
                     action_df = pd.DataFrame(data["action_items"])
                     st.dataframe(action_df, use_container_width=True)
-                    excel_buffer = io.BytesIO()
-                    action_df.to_excel(excel_buffer, index=False, engine="openpyxl")
+                    buf = io.BytesIO()
+                    action_df.to_excel(buf, index=False, engine="openpyxl")
                     col1, col2 = st.columns(2)
                     with col1:
                         st.download_button("⬇️ Download as CSV",
@@ -475,7 +565,7 @@ def main():
                                            file_name="action_items.csv", mime="text/csv")
                     with col2:
                         st.download_button("⬇️ Download as Excel",
-                                           data=excel_buffer.getvalue(),
+                                           data=buf.getvalue(),
                                            file_name="action_items.xlsx",
                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 else:
