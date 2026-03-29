@@ -1,5 +1,5 @@
 """
-Streamlit app: Extract text from image/CSV/XLSX/PDF/paste → LLM → Output → Download
+Streamlit app: Extract text from image/CSV/XLSX/PDF/TXT/paste → LLM → Output → Download
 Supports uploading up to 10 files at once.
 """
 
@@ -16,12 +16,23 @@ import pypdf
 
 # ── 1. LLM CALLS ─────────────────────────────────────────────────────────────
 
-def call_llm_csv(text: str) -> str:
+def call_llm_csv(text: str, column_names: list[str]) -> str:
     """Ask Gemini to extract structured data as a JSON array for export."""
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    if column_names:
+        column_instruction = (
+            f"The output must have exactly these columns in this order: {', '.join(column_names)}. "
+            "If a value is not found for a column, use an empty string."
+        )
+    else:
+        column_instruction = "Determine the best column names from the content."
+
     prompt = f"""
     Extract all structured data from the text below and return it as a JSON array
-    of flat objects (same keys in every object). Return ONLY valid JSON, no explanation.
+    of flat objects with the same keys in every object. Return ONLY valid JSON, no explanation.
+
+    {column_instruction}
 
     Text:
     {text}
@@ -72,28 +83,28 @@ def call_llm_summary(text: str) -> str:
 # ── 2. TEXT EXTRACTION HELPERS ───────────────────────────────────────────────
 
 def extract_text_from_image(uploaded_file) -> str:
-    """Use pytesseract (OCR) to pull text out of an uploaded image."""
     image = Image.open(uploaded_file)
     return pytesseract.image_to_string(image)
 
 
 def extract_text_from_csv(uploaded_file) -> str:
-    """Read a CSV and convert it to plain text for the LLM."""
     df = pd.read_csv(uploaded_file)
     return df.to_string(index=False)
 
 
 def extract_text_from_xlsx(uploaded_file) -> str:
-    """Read an Excel file and convert it to plain text for the LLM."""
     df = pd.read_excel(uploaded_file, engine="openpyxl")
     return df.to_string(index=False)
 
 
 def extract_text_from_pdf(uploaded_file) -> str:
-    """Extract text from each page of an uploaded PDF."""
     reader = pypdf.PdfReader(uploaded_file)
     pages = [page.extract_text() for page in reader.pages if page.extract_text()]
     return "\n\n".join(pages)
+
+
+def extract_text_from_txt(uploaded_file) -> str:
+    return uploaded_file.read().decode("utf-8")
 
 
 def extract_text_from_file(uploaded_file, input_mode: str) -> str:
@@ -106,13 +117,14 @@ def extract_text_from_file(uploaded_file, input_mode: str) -> str:
         return extract_text_from_csv(uploaded_file)
     elif input_mode == "Excel (.xlsx)":
         return extract_text_from_xlsx(uploaded_file)
+    elif input_mode == "Text File (.txt)":
+        return extract_text_from_txt(uploaded_file)
     return ""
 
 
 # ── 3. RESPONSE PARSERS ──────────────────────────────────────────────────────
 
 def parse_csv_response(response: str) -> pd.DataFrame:
-    """Parse a JSON array from the LLM into a DataFrame."""
     cleaned = response.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     data = json.loads(cleaned)
     if not isinstance(data, list):
@@ -121,7 +133,6 @@ def parse_csv_response(response: str) -> pd.DataFrame:
 
 
 def parse_summary_response(response: str) -> dict:
-    """Parse the summary + action items JSON from the LLM."""
     cleaned = response.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     data = json.loads(cleaned)
     if "summary" not in data or "action_items" not in data:
@@ -138,7 +149,11 @@ def main():
 
     # ── Input section ────────────────────────────────────────────────────────
     st.header("1 · Provide input")
-    input_mode = st.radio("Input type", ["Image (OCR)", "PDF", "CSV", "Excel (.xlsx)", "Paste text"], horizontal=True)
+    input_mode = st.radio(
+        "Input type",
+        ["Image (OCR)", "PDF", "CSV", "Excel (.xlsx)", "Text File (.txt)", "Paste text"],
+        horizontal=True
+    )
 
     raw_text = ""
 
@@ -146,12 +161,12 @@ def main():
         raw_text = st.text_area("Paste your text here", height=200,
                                 placeholder="Paste an email, meeting notes, campaign details…")
     else:
-        # Map input mode to accepted file types
         file_type_map = {
-            "Image (OCR)": ["png", "jpg", "jpeg"],
-            "PDF":         ["pdf"],
-            "CSV":         ["csv"],
-            "Excel (.xlsx)": ["xlsx"],
+            "Image (OCR)":      ["png", "jpg", "jpeg"],
+            "PDF":              ["pdf"],
+            "CSV":              ["csv"],
+            "Excel (.xlsx)":    ["xlsx"],
+            "Text File (.txt)": ["txt"],
         }
         accepted_types = file_type_map[input_mode]
 
@@ -161,9 +176,8 @@ def main():
             accept_multiple_files=True,
         )
 
-        # Enforce 10 file limit
         if uploaded_files and len(uploaded_files) > 10:
-            st.warning("Please upload a maximum of 10 files. Only the first 10 will be used.")
+            st.warning("Maximum 10 files allowed. Only the first 10 will be used.")
             uploaded_files = uploaded_files[:10]
 
         if uploaded_files:
@@ -177,7 +191,6 @@ def main():
                         st.error(f"Could not read {f.name}: {e}")
 
             if all_texts:
-                # Combine all file contents into one block of text for the LLM
                 raw_text = "\n\n".join(all_texts)
                 st.success(f"✅ {len(all_texts)} file(s) loaded successfully.")
                 with st.expander("Preview extracted text", expanded=False):
@@ -191,26 +204,53 @@ def main():
         horizontal=True,
     )
 
-    # ── Slide sub-options ────────────────────────────────────────────────────
+    # ── Sub-options ──────────────────────────────────────────────────────────
     num_slides = 3
     slide_titles = ""
+    column_names = []
 
-    if extraction_mode == "Slide Ready":
+    if extraction_mode in ("Extract to CSV", "Extract to Excel"):
+        st.markdown("**Column options**")
+        use_custom_columns = st.toggle("Let me define the columns", value=False)
+        if use_custom_columns:
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                num_columns = st.number_input(
+                    "Number of columns",
+                    min_value=1, max_value=20, value=3, step=1
+                )
+            with col2:
+                columns_input = st.text_input(
+                    "Column names",
+                    placeholder="e.g. Client Name, Campaign Budget, Start Date",
+                    help="Enter comma-separated column names in the order you want them."
+                )
+            if columns_input.strip():
+                column_names = [c.strip() for c in columns_input.split(",") if c.strip()]
+                # If they typed fewer names than the number selected, pad with generic names
+                while len(column_names) < num_columns:
+                    column_names.append(f"Column {len(column_names) + 1}")
+                # Trim to the number selected
+                column_names = column_names[:num_columns]
+                st.caption(f"✅ Columns: {', '.join(column_names)}")
+            else:
+                st.caption("Enter column names above, separated by commas.")
+
+    elif extraction_mode == "Slide Ready":
         st.markdown("**Slide options**")
         col1, col2 = st.columns([1, 2])
         with col1:
             num_slides = st.number_input(
                 "Number of slides",
-                min_value=1, max_value=20, value=3, step=1,
-                help="How many slides to split the content across."
+                min_value=1, max_value=20, value=3, step=1
             )
         with col2:
             slide_titles = st.text_input(
                 "Slide titles (optional)",
                 placeholder="e.g. Overview, Campaign Details, Next Steps",
-                help="Enter comma-separated titles. If left blank, titles will be auto-generated."
+                help="Comma-separated. Leave blank to auto-generate."
             )
-        st.caption("💡 Tip: if you enter titles, the number of slides will match the number of titles you provide.")
+        st.caption("💡 If you enter titles, the number of slides will match the number of titles.")
 
     # ── Run ──────────────────────────────────────────────────────────────────
     st.header("3 · Extract")
@@ -220,7 +260,7 @@ def main():
         with st.spinner("Sending to Gemini..."):
             try:
                 if extraction_mode in ("Extract to CSV", "Extract to Excel"):
-                    llm_output = call_llm_csv(raw_text)
+                    llm_output = call_llm_csv(raw_text, column_names)
                 elif extraction_mode == "Slide Ready":
                     llm_output = call_llm_slide(raw_text, num_slides, slide_titles)
                 else:
@@ -236,8 +276,8 @@ def main():
             try:
                 df = parse_csv_response(llm_output)
                 st.dataframe(df, use_container_width=True)
-                csv_bytes = df.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Download as CSV", data=csv_bytes,
+                st.download_button("⬇️ Download as CSV",
+                                   data=df.to_csv(index=False).encode("utf-8"),
                                    file_name="extracted_data.csv", mime="text/csv")
             except (json.JSONDecodeError, ValueError) as e:
                 st.error(f"Could not parse response: {e}")
@@ -249,7 +289,8 @@ def main():
                 st.dataframe(df, use_container_width=True)
                 excel_buffer = io.BytesIO()
                 df.to_excel(excel_buffer, index=False, engine="openpyxl")
-                st.download_button("⬇️ Download as Excel", data=excel_buffer.getvalue(),
+                st.download_button("⬇️ Download as Excel",
+                                   data=excel_buffer.getvalue(),
                                    file_name="extracted_data.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             except (json.JSONDecodeError, ValueError) as e:
@@ -258,7 +299,8 @@ def main():
 
         elif extraction_mode == "Slide Ready":
             st.markdown(llm_output)
-            st.download_button("⬇️ Download as .txt", data=llm_output.encode("utf-8"),
+            st.download_button("⬇️ Download as .txt",
+                               data=llm_output.encode("utf-8"),
                                file_name="slide_content.txt", mime="text/plain")
 
         else:  # Summary & Action Items
