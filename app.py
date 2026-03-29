@@ -1,5 +1,6 @@
 """
 Streamlit app: Extract text from image/CSV/XLSX/PDF/paste → LLM → Output → Download
+Supports uploading up to 10 files at once.
 """
 
 import io
@@ -32,14 +33,11 @@ def call_llm_csv(text: str) -> str:
 def call_llm_slide(text: str, num_slides: int, slide_titles: str) -> str:
     """Ask Gemini to reformat content as structured slide-ready bullet points."""
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-
-    # Build slide title instructions based on what the user provided
     if slide_titles.strip():
         titles = [t.strip() for t in slide_titles.split(",") if t.strip()]
         title_instruction = f"Use exactly these slide titles in this order: {', '.join(titles)}."
     else:
         title_instruction = f"Create {num_slides} slides with appropriate titles based on the content."
-
     prompt = f"""
     Reformat the content below into structured presentation slides.
     {title_instruction}
@@ -98,6 +96,19 @@ def extract_text_from_pdf(uploaded_file) -> str:
     return "\n\n".join(pages)
 
 
+def extract_text_from_file(uploaded_file, input_mode: str) -> str:
+    """Route a single file to the correct extractor based on input mode."""
+    if input_mode == "Image (OCR)":
+        return extract_text_from_image(uploaded_file)
+    elif input_mode == "PDF":
+        return extract_text_from_pdf(uploaded_file)
+    elif input_mode == "CSV":
+        return extract_text_from_csv(uploaded_file)
+    elif input_mode == "Excel (.xlsx)":
+        return extract_text_from_xlsx(uploaded_file)
+    return ""
+
+
 # ── 3. RESPONSE PARSERS ──────────────────────────────────────────────────────
 
 def parse_csv_response(response: str) -> pd.DataFrame:
@@ -118,38 +129,12 @@ def parse_summary_response(response: str) -> dict:
     return data
 
 
-# ── 4. DOWNLOAD HELPERS ──────────────────────────────────────────────────────
-
-def download_buttons(df: pd.DataFrame, csv_filename: str, excel_filename: str):
-    """Show both a CSV and an Excel download button for a given DataFrame."""
-    col1, col2 = st.columns(2)
-
-    with col1:
-        csv_bytes = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="⬇️ Download as CSV",
-            data=csv_bytes,
-            file_name=csv_filename,
-            mime="text/csv"
-        )
-
-    with col2:
-        excel_buffer = io.BytesIO()
-        df.to_excel(excel_buffer, index=False, engine="openpyxl")
-        st.download_button(
-            label="⬇️ Download as Excel",
-            data=excel_buffer.getvalue(),
-            file_name=excel_filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-
-# ── 5. STREAMLIT UI ──────────────────────────────────────────────────────────
+# ── 4. STREAMLIT UI ──────────────────────────────────────────────────────────
 
 def main():
     st.set_page_config(page_title="Navistone Content Extractor", layout="centered")
     st.title("📋 Navistone Content Extractor")
-    st.caption("Upload an image, PDF, CSV, Excel, or paste text — then choose how to extract it.")
+    st.caption("Upload up to 10 files or paste text — then choose how to extract it.")
 
     # ── Input section ────────────────────────────────────────────────────────
     st.header("1 · Provide input")
@@ -157,43 +142,52 @@ def main():
 
     raw_text = ""
 
-    if input_mode == "Image (OCR)":
-        img_file = st.file_uploader("Upload PNG or JPG", type=["png", "jpg", "jpeg"])
-        if img_file:
-            st.image(img_file, caption="Uploaded image", use_container_width=True)
-            with st.spinner("Reading text from image..."):
-                raw_text = extract_text_from_image(img_file)
-            st.text_area("Extracted text (OCR)", raw_text, height=160, disabled=True)
-
-    elif input_mode == "PDF":
-        pdf_file = st.file_uploader("Upload PDF", type=["pdf"])
-        if pdf_file:
-            with st.spinner("Reading text from PDF..."):
-                raw_text = extract_text_from_pdf(pdf_file)
-            st.text_area("Extracted text (PDF)", raw_text, height=160, disabled=True)
-
-    elif input_mode == "CSV":
-        csv_file = st.file_uploader("Upload CSV", type=["csv"])
-        if csv_file:
-            raw_text = extract_text_from_csv(csv_file)
-            st.text_area("CSV as text", raw_text, height=160, disabled=True)
-
-    elif input_mode == "Excel (.xlsx)":
-        xlsx_file = st.file_uploader("Upload Excel file", type=["xlsx"])
-        if xlsx_file:
-            with st.spinner("Reading Excel file..."):
-                raw_text = extract_text_from_xlsx(xlsx_file)
-            st.text_area("Excel as text", raw_text, height=160, disabled=True)
-
-    else:  # Paste text
+    if input_mode == "Paste text":
         raw_text = st.text_area("Paste your text here", height=200,
                                 placeholder="Paste an email, meeting notes, campaign details…")
+    else:
+        # Map input mode to accepted file types
+        file_type_map = {
+            "Image (OCR)": ["png", "jpg", "jpeg"],
+            "PDF":         ["pdf"],
+            "CSV":         ["csv"],
+            "Excel (.xlsx)": ["xlsx"],
+        }
+        accepted_types = file_type_map[input_mode]
+
+        uploaded_files = st.file_uploader(
+            f"Upload up to 10 {input_mode} files",
+            type=accepted_types,
+            accept_multiple_files=True,
+        )
+
+        # Enforce 10 file limit
+        if uploaded_files and len(uploaded_files) > 10:
+            st.warning("Please upload a maximum of 10 files. Only the first 10 will be used.")
+            uploaded_files = uploaded_files[:10]
+
+        if uploaded_files:
+            all_texts = []
+            for f in uploaded_files:
+                with st.spinner(f"Reading {f.name}..."):
+                    try:
+                        text = extract_text_from_file(f, input_mode)
+                        all_texts.append(f"--- {f.name} ---\n{text}")
+                    except Exception as e:
+                        st.error(f"Could not read {f.name}: {e}")
+
+            if all_texts:
+                # Combine all file contents into one block of text for the LLM
+                raw_text = "\n\n".join(all_texts)
+                st.success(f"✅ {len(all_texts)} file(s) loaded successfully.")
+                with st.expander("Preview extracted text", expanded=False):
+                    st.text_area("Combined text from all files", raw_text, height=200, disabled=True)
 
     # ── Extraction mode ──────────────────────────────────────────────────────
     st.header("2 · Choose extraction type")
     extraction_mode = st.radio(
         "What do you want?",
-        ["Extract to CSV / Excel", "Slide Ready", "Summary & Action Items"],
+        ["Extract to CSV", "Extract to Excel", "Slide Ready", "Summary & Action Items"],
         horizontal=True,
     )
 
@@ -204,14 +198,12 @@ def main():
     if extraction_mode == "Slide Ready":
         st.markdown("**Slide options**")
         col1, col2 = st.columns([1, 2])
-
         with col1:
             num_slides = st.number_input(
                 "Number of slides",
                 min_value=1, max_value=20, value=3, step=1,
                 help="How many slides to split the content across."
             )
-
         with col2:
             slide_titles = st.text_input(
                 "Slide titles (optional)",
@@ -227,7 +219,7 @@ def main():
     if run:
         with st.spinner("Sending to Gemini..."):
             try:
-                if extraction_mode == "Extract to CSV / Excel":
+                if extraction_mode in ("Extract to CSV", "Extract to Excel"):
                     llm_output = call_llm_csv(raw_text)
                 elif extraction_mode == "Slide Ready":
                     llm_output = call_llm_slide(raw_text, num_slides, slide_titles)
@@ -240,11 +232,26 @@ def main():
         # ── Display results ──────────────────────────────────────────────────
         st.header("4 · Results")
 
-        if extraction_mode == "Extract to CSV / Excel":
+        if extraction_mode == "Extract to CSV":
             try:
                 df = parse_csv_response(llm_output)
                 st.dataframe(df, use_container_width=True)
-                download_buttons(df, "extracted_data.csv", "extracted_data.xlsx")
+                csv_bytes = df.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download as CSV", data=csv_bytes,
+                                   file_name="extracted_data.csv", mime="text/csv")
+            except (json.JSONDecodeError, ValueError) as e:
+                st.error(f"Could not parse response: {e}")
+                st.code(llm_output)
+
+        elif extraction_mode == "Extract to Excel":
+            try:
+                df = parse_csv_response(llm_output)
+                st.dataframe(df, use_container_width=True)
+                excel_buffer = io.BytesIO()
+                df.to_excel(excel_buffer, index=False, engine="openpyxl")
+                st.download_button("⬇️ Download as Excel", data=excel_buffer.getvalue(),
+                                   file_name="extracted_data.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             except (json.JSONDecodeError, ValueError) as e:
                 st.error(f"Could not parse response: {e}")
                 st.code(llm_output)
@@ -266,7 +273,18 @@ def main():
                 if data["action_items"]:
                     action_df = pd.DataFrame(data["action_items"])
                     st.dataframe(action_df, use_container_width=True)
-                    download_buttons(action_df, "action_items.csv", "action_items.xlsx")
+                    excel_buffer = io.BytesIO()
+                    action_df.to_excel(excel_buffer, index=False, engine="openpyxl")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.download_button("⬇️ Download as CSV",
+                                           data=action_df.to_csv(index=False).encode("utf-8"),
+                                           file_name="action_items.csv", mime="text/csv")
+                    with col2:
+                        st.download_button("⬇️ Download as Excel",
+                                           data=excel_buffer.getvalue(),
+                                           file_name="action_items.xlsx",
+                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 else:
                     st.info("No action items found.")
 
