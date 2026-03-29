@@ -1,5 +1,5 @@
 """
-Streamlit app: Extract text from image/CSV/PDF/paste → LLM → Output → Download
+Streamlit app: Extract text from image/CSV/XLSX/PDF/paste → LLM → Output → Download
 """
 
 import io
@@ -29,12 +29,22 @@ def call_llm_csv(text: str) -> str:
     return response.text
 
 
-def call_llm_slide(text: str) -> str:
-    """Ask Gemini to reformat content as clean slide-ready bullet points."""
+def call_llm_slide(text: str, num_slides: int, slide_titles: str) -> str:
+    """Ask Gemini to reformat content as structured slide-ready bullet points."""
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    # Build slide title instructions based on what the user provided
+    if slide_titles.strip():
+        titles = [t.strip() for t in slide_titles.split(",") if t.strip()]
+        title_instruction = f"Use exactly these slide titles in this order: {', '.join(titles)}."
+    else:
+        title_instruction = f"Create {num_slides} slides with appropriate titles based on the content."
+
     prompt = f"""
-    Reformat the content below into clean, concise bullet points suitable for a
-    presentation slide. Group related points under short bold headings where helpful.
+    Reformat the content below into structured presentation slides.
+    {title_instruction}
+    Each slide should have a clear bold title followed by 3-5 concise bullet points.
+    Distribute the content evenly and logically across the slides.
     Return plain text only, no JSON, no markdown code blocks.
 
     Text:
@@ -72,6 +82,12 @@ def extract_text_from_image(uploaded_file) -> str:
 def extract_text_from_csv(uploaded_file) -> str:
     """Read a CSV and convert it to plain text for the LLM."""
     df = pd.read_csv(uploaded_file)
+    return df.to_string(index=False)
+
+
+def extract_text_from_xlsx(uploaded_file) -> str:
+    """Read an Excel file and convert it to plain text for the LLM."""
+    df = pd.read_excel(uploaded_file, engine="openpyxl")
     return df.to_string(index=False)
 
 
@@ -133,11 +149,11 @@ def download_buttons(df: pd.DataFrame, csv_filename: str, excel_filename: str):
 def main():
     st.set_page_config(page_title="Navistone Content Extractor", layout="centered")
     st.title("📋 Navistone Content Extractor")
-    st.caption("Upload an image, PDF, CSV, or paste text — then choose how to extract it.")
+    st.caption("Upload an image, PDF, CSV, Excel, or paste text — then choose how to extract it.")
 
     # ── Input section ────────────────────────────────────────────────────────
     st.header("1 · Provide input")
-    input_mode = st.radio("Input type", ["Image (OCR)", "PDF", "CSV", "Paste text"], horizontal=True)
+    input_mode = st.radio("Input type", ["Image (OCR)", "PDF", "CSV", "Excel (.xlsx)", "Paste text"], horizontal=True)
 
     raw_text = ""
 
@@ -162,6 +178,13 @@ def main():
             raw_text = extract_text_from_csv(csv_file)
             st.text_area("CSV as text", raw_text, height=160, disabled=True)
 
+    elif input_mode == "Excel (.xlsx)":
+        xlsx_file = st.file_uploader("Upload Excel file", type=["xlsx"])
+        if xlsx_file:
+            with st.spinner("Reading Excel file..."):
+                raw_text = extract_text_from_xlsx(xlsx_file)
+            st.text_area("Excel as text", raw_text, height=160, disabled=True)
+
     else:  # Paste text
         raw_text = st.text_area("Paste your text here", height=200,
                                 placeholder="Paste an email, meeting notes, campaign details…")
@@ -170,14 +193,32 @@ def main():
     st.header("2 · Choose extraction type")
     extraction_mode = st.radio(
         "What do you want?",
-        ["Extract to CSV", "Slide Ready", "Summary & Action Items"],
+        ["Extract to CSV / Excel", "Slide Ready", "Summary & Action Items"],
         horizontal=True,
-        help=(
-            "Extract to CSV: pulls structured data into a downloadable spreadsheet. "
-            "Slide Ready: formats content as bullet points for a presentation. "
-            "Summary & Action Items: key takeaways plus a list of tasks and owners."
-        )
     )
+
+    # ── Slide sub-options ────────────────────────────────────────────────────
+    num_slides = 3
+    slide_titles = ""
+
+    if extraction_mode == "Slide Ready":
+        st.markdown("**Slide options**")
+        col1, col2 = st.columns([1, 2])
+
+        with col1:
+            num_slides = st.number_input(
+                "Number of slides",
+                min_value=1, max_value=20, value=3, step=1,
+                help="How many slides to split the content across."
+            )
+
+        with col2:
+            slide_titles = st.text_input(
+                "Slide titles (optional)",
+                placeholder="e.g. Overview, Campaign Details, Next Steps",
+                help="Enter comma-separated titles. If left blank, titles will be auto-generated."
+            )
+        st.caption("💡 Tip: if you enter titles, the number of slides will match the number of titles you provide.")
 
     # ── Run ──────────────────────────────────────────────────────────────────
     st.header("3 · Extract")
@@ -186,10 +227,10 @@ def main():
     if run:
         with st.spinner("Sending to Gemini..."):
             try:
-                if extraction_mode == "Extract to CSV":
+                if extraction_mode == "Extract to CSV / Excel":
                     llm_output = call_llm_csv(raw_text)
                 elif extraction_mode == "Slide Ready":
-                    llm_output = call_llm_slide(raw_text)
+                    llm_output = call_llm_slide(raw_text, num_slides, slide_titles)
                 else:
                     llm_output = call_llm_summary(raw_text)
             except Exception as e:
@@ -199,7 +240,7 @@ def main():
         # ── Display results ──────────────────────────────────────────────────
         st.header("4 · Results")
 
-        if extraction_mode == "Extract to CSV":
+        if extraction_mode == "Extract to CSV / Excel":
             try:
                 df = parse_csv_response(llm_output)
                 st.dataframe(df, use_container_width=True)
